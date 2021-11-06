@@ -22,6 +22,7 @@
 #include "dosbox.h"
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <sys/types.h>
+#include <thread>
 #include <tuple>
 #include <math.h>
 #ifdef WIN32
@@ -395,6 +397,9 @@ struct SDL_Block {
 	SDL_Surface *surface = nullptr;
 	SDL_Window *window = nullptr;
 	SDL_Renderer *renderer = nullptr;
+	std::atomic_bool is_frame_due = false;
+	bool can_use_precise_delay = false;
+
 	std::string render_driver = "";
 	int display_number = 0;
 	struct {
@@ -1221,6 +1226,15 @@ static PPScale calc_pp_scale(const int avw, const int avh)
 	               is_draw_size_doubled(), avw, avh);
 }
 
+// Returns true if the host can handle another frame and resets the state to
+// false. Because subsequent calls return negative until the frame-tempo
+// re-enables it, this ensures that only one frame is attemped to be drawn
+// within the frame period (unless the value is saved to a variable).
+static bool IsFrameDue()
+{
+	return sdl.is_frame_due.exchange(false);
+}
+
 Bitu GFX_SetSize(int width,
                  int height,
                  const Bitu flags,
@@ -1898,7 +1912,32 @@ bool GFX_StartUpdate(uint8_t * &pixels, int &pitch)
 	return false;
 }
 
-void GFX_EndUpdate(const Bit16u *changedLines)
+static void update_frame_tempo()
+{
+	static std::thread tempo_thread = {};
+
+	// Record the current refresh rate
+	static std::atomic<int8_t> rate = 0;
+	const auto current_rate = GFX_GetDisplayRefreshRate();
+	if (rate.load() == current_rate)
+		return;
+
+	rate.store(current_rate);
+	auto &is_due = sdl.is_frame_due;
+	std::thread t([&]() {
+		auto delay_us = sdl.can_use_precise_delay ? DelayPrecise : DelayUs;
+		const auto tempo_us = (1000000 + rate - 1) / rate;
+		while (true) {
+			delay_us(tempo_us);
+			is_due.store(true);
+		}
+	});
+	set_thread_name(t, "dosbox:fpstempo");
+	tempo_thread = std::move(t);
+	tempo_thread.detach();
+}
+
+void GFX_EndUpdate(const uint16_t *changedLines)
 {
 	if (!sdl.update_display_contents)
 		return;
@@ -2785,6 +2824,8 @@ static void GUI_StartUp(Section *sec)
 	//      correctly and is causing serious bugs.
 	sdl.desktop.vsync = section->Get_bool("vsync");
 	sdl.desktop.vsync_skip = section->Get_int("vsync_skip");
+
+	sdl.can_use_precise_delay = CanDelayPrecise();
 
 	const int display = section->Get_int("display");
 	if ((display >= 0) && (display < SDL_GetNumVideoDisplays())) {
